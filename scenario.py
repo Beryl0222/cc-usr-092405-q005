@@ -10,7 +10,12 @@
 6. 跨时区重复交付（莫斯科/北京同哈希）只入账一次；
 7. 发行前撤权：准确阻断未发布版本并指出受影响渠道；
 8. 上线后撤权：在线副本下架，收益依据保留为上线时冻结快照；
-9. 管理看板：各市场成片、未决阻塞、收益分配依据、撤权波及的每个副本。
+9. 平台结算迟到且按市场/渠道/币种拆成多笔：逐笔关联已发行副本与冻结分成规则；
+10. 退款与更正只追加新行；汇率按结算日版本化，跨币种舍入余差单独入账；
+11. 撤权后的新增收入按收入期间拆分并单独隔离，不计入可支付余额；
+12. 差异超阈值自动建立争议并冻结该市场可分配余额，制作方与权利方分别批准后结案；
+13. 同一外部流水重复到达（含重启后再次导入）只入账一次，台账始终一致；
+14. 管理看板：各市场成片、未决阻塞、收益分配依据、撤权波及与财务台账。
 """
 
 from domain import (
@@ -18,6 +23,7 @@ from domain import (
     ELEMENT_ALLOWED, ELEMENT_RESTRICTED, ELEMENT_FORBIDDEN,
     PROPOSAL_ACCEPTED, ASSET_CONFIRMED, ASSET_UNCONFIRMED,
     DEP_BLOCKED, DEP_ONLINE, DEP_TAKEN_DOWN, DELIVERY_DUPLICATE,
+    ENTRY_REFUND,
 )
 
 T0 = "2026-09-10"
@@ -300,6 +306,114 @@ def run():
     # 历史收益依据仍保留上线瞬间冻结的快照
     frozen = ru_after["deployments"][0]["revenue_basis"]
 
+    # ---- 13. 财务结算：迟到回款、多币种拆分、争议与撤权隔离 ----------------
+    # 上线批次是 09-20，平台结算 10 月才陆续到达（迟到结算）；
+    # 同一版本按市场/渠道/币种拆成多笔到账。
+    dep_ru = release_ru["results"][0]["deployment_id"]
+    dep_us = release_us["results"][0]["deployment_id"]
+    dep_kr = release_kr["results"][0]["deployment_id"]
+
+    # 汇率按结算日版本化：USD 为基准币；KRW 在 10-01 改版，两版并存
+    d.set_fx_rate("KRW", 0.00072, "2026-09-01")
+    d.set_fx_rate("KRW", 0.00075, "2026-10-01")
+    d.set_fx_rate("RUB", 0.011, "2026-09-01")
+
+    # US：09 月账期的结算 10-05 才到；实收短少 8% 超过默认阈值 2%
+    us_line = step("US 迟到结算到账（实收短少 8%，自动建争议）",
+                   d.import_settlement(
+                       external_txn_id="PIX-202609-US", deployment_id=dep_us,
+                       platform="PixPlay", currency="USD",
+                       gross_amount=10000, received_amount=9200,
+                       period_start="2026-09-20", period_end="2026-09-30",
+                       settlement_date="2026-10-05"))
+    us_dispute = next(iter(d.disputes.values()))
+    assert d.market_balance("US")["frozen"]
+    assert d.market_balance("US")["payable_base"] == 0.0
+
+    # 争议须制作方与权利方分别批准；仅一方批准不能结案
+    d.approve_dispute(us_dispute["id"], "producer", "制片主任-陈")
+    try:
+        d.resolve_dispute(us_dispute["id"], "release")
+        raise AssertionError("单方批准不应结案")
+    except Exception:
+        pass
+    d.approve_dispute(us_dispute["id"], "rights_holder", "长河小说版权部")
+    # 双方批准平台补款凭证后按 adjust 结案：更正行只追加、不改写原行
+    step("US 争议双方批准后按平台补款调整结案",
+         d.resolve_dispute(us_dispute["id"], "adjust", correction={
+             "external_txn_id": "PIX-202609-US-CORR",
+             "received_amount": 780,
+             "settlement_date": "2026-10-12",
+             "note": "平台补发渠道分成差额",
+         }))
+    assert not d.market_balance("US")["frozen"]
+
+    # US 还有一笔 10 月账期的退款：只追加退款行，原结算行不动
+    step("US 退款只追加新行（用户退订回溯）",
+         d.import_settlement(
+             external_txn_id="PIX-202610-US-RFD", entry_type=ENTRY_REFUND,
+             corrects_txn_id="PIX-202609-US", currency="USD",
+             gross_amount=300, received_amount=300,
+             period_start="2026-10-01", period_end="2026-10-15",
+             settlement_date="2026-10-20", note="退订回溯"))
+
+    # KR：韩元结算，跨币种换算产生舍入余差；汇率按结算日取 10-01 改版后的 0.00075
+    kr_line = step("KR 韩元结算（跨币种舍入余差入账）",
+                   d.import_settlement(
+                       external_txn_id="WAV-202610-KR", deployment_id=dep_kr,
+                       platform="Wave", currency="KRW",
+                       gross_amount=6666667, received_amount=6666667,
+                       period_start="2026-09-20", period_end="2026-09-30",
+                       settlement_date="2026-10-08"))
+    assert kr_line["fx_rate"] == 0.00075
+    assert d.market_balance("KR")["rounding_residual_base"] != 0.0
+
+    # RU：上线后撤权（09-22），平台 10 月才结 09 月账期——
+    # 收入期间跨过撤回日，按天拆分：09-20/21 正常可分配，09-22 起隔离
+    ru_line = step("RU 迟到结算跨撤回日拆分（撤权后收入单独隔离）",
+                   d.import_settlement(
+                       external_txn_id="RSP-202609-RU", deployment_id=dep_ru,
+                       platform="俄境流云平台", currency="RUB",
+                       gross_amount=110000, received_amount=110000,
+                       period_start="2026-09-20", period_end="2026-09-30",
+                       settlement_date="2026-10-06"))
+    ru_parts = {p["label"]: p for p in ru_line["parts"]}
+    assert ru_parts["pre_withdrawal"]["days"] == 2
+    assert ru_parts["post_withdrawal"]["days"] == 9
+    assert ru_parts["post_withdrawal"]["quarantined"]
+    ru_balance = d.market_balance("RU")
+    assert ru_balance["quarantined_base"] == ru_parts["post_withdrawal"]["received_base"]
+    assert ru_balance["payable_base"] == ru_parts["pre_withdrawal"]["received_base"]
+
+    # 同一外部流水重复到达（平台重推/补发文件）不重复入账
+    dup_line = d.import_settlement(
+        external_txn_id="PIX-202609-US", deployment_id=dep_us,
+        platform="PixPlay", currency="USD",
+        gross_amount=10000, received_amount=9200,
+        period_start="2026-09-20", period_end="2026-09-30",
+        settlement_date="2026-10-05")
+    assert dup_line["id"] == us_line["id"]
+
+    # 重启后再次导入：从快照恢复，外部流水幂等键仍在，台账分毫不差
+    before = {m: d.market_balance(m) for m in ("US", "KR", "RU")}
+    restored = Domain.restore(d.snapshot(), now=clock)
+    again = restored.import_settlement(
+        external_txn_id="PIX-202609-US", deployment_id=dep_us,
+        platform="PixPlay", currency="USD",
+        gross_amount=10000, received_amount=9200,
+        period_start="2026-09-20", period_end="2026-09-30",
+        settlement_date="2026-10-05")
+    assert again["id"] == us_line["id"]
+    assert len(restored.settlement_lines) == len(d.settlement_lines)
+    for market, balance in before.items():
+        assert restored.market_balance(market) == balance
+    step("重启后再次导入同一批结算：余额逐市场一致", before)
+
+    # 财务逐笔追溯：从外部流水号追到应收、实收、分成与可支付余额
+    us_trace = d.settlement_report("PIX-202609-US")
+    assert us_trace["line"]["frozen_basis"]["grants"]
+    assert us_trace["corrections"][0]["external_txn_id"] == "PIX-202609-US-CORR"
+
     dashboard = d.dashboard(at=T_WITHDRAW_AFTER)
     return {
         "title": "首部作品《丝路长风·破晓》多地上线样例",
@@ -318,6 +432,13 @@ def run():
                 post_withdraw["affected_channels"],
             "post_withdraw_released_assignments":
                 post_withdraw["released_assignments"],
+            "US_dispute_variance_ratio": us_dispute["variance_ratio"],
+            "US_dispute_resolution": d.disputes[us_dispute["id"]]["status"],
+            "US_payable_after_adjust": d.market_balance("US")["payable_base"],
+            "KR_rounding_residual": d.market_balance("KR")["rounding_residual_base"],
+            "RU_quarantined_base": ru_balance["quarantined_base"],
+            "RU_payable_pre_withdrawal_only": ru_balance["payable_base"],
+            "restart_reimport_balances": before,
         },
         "dashboard": dashboard,
     }

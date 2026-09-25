@@ -18,6 +18,15 @@
 - **跨时区交付幂等**：以 `(版本, 内容哈希)` 归一化到 UTC 去重，重复提交只入账一次。
 - **撤权精确波及**：未发布版本被阻断并列出受影响渠道；已上线副本下架；
   团队领料访问收回；上线时冻结的收益分成与工时快照保留不变。
+- **结算对账**：平台结算可迟到、按市场/渠道/币种拆成多笔导入；结算行关联已发行
+  副本与上线时冻结的分成规则，同一外部流水只入账一次（含重启后再次导入）。
+- **退款/更正只追加**：历史结算行不可改写，退款与更正以新行追加并回指原行。
+- **汇率版本化**：按 `(币种, 生效日)` 登记且不可改写，换算取结算日当日生效版本；
+  跨币种舍入余差单独入账。
+- **撤权收入隔离**：收入期间跨过授权撤回日的部分按天拆分，撤回后新增收入单独
+  隔离，不计入可支付余额。
+- **争议双批准**：实收与应收差异超过市场阈值自动建立争议并冻结该市场可分配余额；
+  制作方与权利方分别批准后才可释放或调整（调整以更正行追加）。
 
 ## 运行
 
@@ -25,7 +34,8 @@
 python3 service.py --check       # 基础自检
 python3 service.py --scenario    # 首部作品《丝路长风·破晓》六市场端到端样例（JSON）
 python3 service.py --port 8000   # 启动 HTTP 服务
-npm test                         # 全部契约测试（30 项）
+python3 service.py --port 8000 --state data/state.json  # 带状态快照：重启自动恢复
+npm test                         # 全部契约测试（50 项）
 python3 -m compileall -q .       # 编译检查全部 Python 模块
 ```
 
@@ -35,8 +45,10 @@ python3 -m compileall -q .       # 编译检查全部 Python 模块
 | --- | --- | --- |
 | GET | `/health` | 服务身份健康检查 |
 | POST | `/actions` | 统一业务动作入口，body 为 `{"action": "...", ...}` |
-| GET | `/versions/<id>` | 版本完整报告：版本关系、三关核验、工时、收益依据、各渠道副本 |
-| GET | `/dashboard` | 管理看板：分市场成片索引、未决阻塞、收益分配依据、撤权波及的每个副本 |
+| GET | `/versions/<id>` | 版本完整报告：版本关系、三关核验、工时、收益依据、各渠道副本与已入账结算行 |
+| GET | `/dashboard` | 管理看板：分市场成片索引、未决阻塞、收益分配依据、撤权波及、财务台账总览 |
+| GET | `/settlements/<外部流水号>` | 逐笔追溯：结算行、冻结分成规则、各方应收/实收、隔离部分、关联争议与更正行 |
+| GET | `/ledger/market/<市场>` | 市场台账：应收、实收、隔离款、舍入余差、可支付余额、逐笔结算行与争议 |
 
 业务错误返回 400（规则冲突/参数问题）或 404（对象或动作不存在），
 统一形如 `{"error": "...", "message": "...", "details": {}}`。
@@ -60,6 +72,10 @@ python3 -m compileall -q .       # 编译检查全部 Python 模块
 | `register_delivery` | `content_hash,delivered_at(带时区)` | 成片交付；跨时区同哈希只入账一次 |
 | `submit_review` / `set_rating` | `result=passed/failed`、`rating` | 译审文化复核与当地分级 |
 | `register_channel` / `request_release` | `code,market`；`channel_codes` | 渠道登记与发行三关核验 |
+| `set_base_currency` / `set_fx_rate` | `currency`；`currency,rate,effective_date` | 对账基准币；汇率按生效日版本化登记（不可改写） |
+| `set_variance_rule` | `threshold,market` | 争议差异阈值：默认全局，可按市场覆盖 |
+| `import_settlement` | `external_txn_id,deployment_id,currency,gross_amount,received_amount,period_start,period_end,settlement_date`；退款/更正加 `entry_type,corrects_txn_id` | 导入平台结算行：关联已发行副本与冻结分成规则；同一外部流水只入账一次 |
+| `approve_dispute` / `resolve_dispute` | `dispute_id,party(producer/rights_holder),approver`；`resolution(release/adjust),correction` | 争议双批准与结案；adjust 以更正行追加入账 |
 
 ### 快速示例
 
@@ -72,7 +88,7 @@ curl -s localhost:8000/dashboard
 ## 文件
 
 - `domain.py` — 领域核心：实体、版本关系与全部业务规则（无框架、无持久化依赖）
-- `service.py` — HTTP 入口与动作编解码，规则全部委托给领域层
-- `scenario.py` — 首部作品六市场权利矩阵端到端样例（含撤权前/后两种波及）
+- `service.py` — HTTP 入口与动作编解码，规则全部委托给领域层；`--state` 开启快照持久化
+- `scenario.py` — 首部作品六市场权利矩阵端到端样例（含撤权前/后波及与财务结算章）
 - `fixtures/domain.json` — 统一领域称谓与状态词表
-- `*_contract.py` — 契约测试（健康入口、领域规则、HTTP API）
+- `*_contract.py` — 契约测试（健康入口、领域规则、财务结算、HTTP API）

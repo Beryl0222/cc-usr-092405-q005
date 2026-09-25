@@ -76,12 +76,52 @@ ACTION_FIELDS = {
         "register_channel", ["code", "name", "market"]),
     "request_release": (
         "request_release", ["version_id", "channel_codes", "at"]),
+    # ---- 财务结算 ----
+    "set_base_currency": ("set_base_currency", ["currency"]),
+    "set_fx_rate": (
+        "set_fx_rate", ["currency", "rate", "effective_date"]),
+    "set_variance_rule": (
+        "set_variance_rule", ["threshold", "market"]),
+    "import_settlement": (
+        "import_settlement",
+        ["external_txn_id", "entry_type", "deployment_id", "version_id",
+         "channel_code", "platform", "market", "currency", "gross_amount",
+         "received_amount", "period_start", "period_end", "settlement_date",
+         "corrects_txn_id", "dispute_id", "note"]),
+    "approve_dispute": (
+        "approve_dispute", ["dispute_id", "party", "approver", "note"]),
+    "resolve_dispute": (
+        "resolve_dispute", ["dispute_id", "resolution", "correction"]),
 }
 
 
 def health_payload():
     """返回稳定的服务身份信息。"""
     return {"status": "ok", "service": SERVICE_ID, "name": SERVICE_NAME}
+
+
+def save_state(domain, path):
+    """把领域状态落盘；重启后再次导入同一外部流水仍只入账一次。"""
+    import os
+    import tempfile
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(domain.snapshot(), handle, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def load_state(path):
+    """从快照恢复领域状态；文件不存在或损坏时返回 None（全新启动）。"""
+    import os
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return Domain.restore(json.load(handle))
+    except (ValueError, OSError, KeyError):
+        return None
 
 
 def dispatch(domain, payload):
@@ -108,6 +148,7 @@ class Handler(BaseHTTPRequestHandler):
     """提供健康检查、领域动作与只读看板。"""
 
     domain = Domain()
+    state_path = None       # 设置后每个成功动作都会落盘快照，重启可恢复
 
     def _write_json(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -128,6 +169,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_json(200, self.domain.version_report(version_id))
             except DomainError as error:
                 self._write_json(error.http_status, error.to_dict())
+        elif self.path.startswith("/settlements/"):
+            txn_id = self.path[len("/settlements/"):]
+            try:
+                self._write_json(200, self.domain.settlement_report(txn_id))
+            except DomainError as error:
+                self._write_json(error.http_status, error.to_dict())
+        elif self.path.startswith("/ledger/market/"):
+            market = self.path[len("/ledger/market/"):]
+            self._write_json(200, self.domain.market_ledger(market))
         else:
             self.send_error(404)
 
@@ -150,6 +200,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write_json(error.http_status, error.to_dict())
             return
         self._write_json(200, result if result is not None else {"ok": True})
+        if self.state_path:
+            save_state(self.domain, self.state_path)
 
     def log_message(self, *_args):
         return
@@ -162,6 +214,8 @@ def main():
                         help="不启动服务，执行基础自检")
     parser.add_argument("--scenario", action="store_true",
                         help="运行首部作品多地上线样例并输出看板 JSON")
+    parser.add_argument("--state", default=None,
+                        help="状态快照文件路径：每个动作落盘，重启自动恢复")
     args = parser.parse_args()
     if args.check:
         assert health_payload()["service"] == SERVICE_ID
@@ -173,6 +227,11 @@ def main():
         import scenario
         print(json.dumps(scenario.run(), ensure_ascii=False, indent=2))
         return
+    if args.state:
+        restored = load_state(args.state)
+        if restored is not None:
+            Handler.domain = restored
+        Handler.state_path = args.state
     ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
 
 
