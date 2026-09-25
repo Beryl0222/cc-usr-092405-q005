@@ -10,11 +10,19 @@
 * 返工产生新版本，原版本工时一经核算即锁定，只能追加、不能改写；
 * 同一内容哈希跨时区重复交付只入账一次；
 * 发行必须同时通过权利、文化复核、当地分级三关；
-* 撤权准确阻断未发布版本、下架已上线副本，并列出受影响渠道。
+* 撤权准确阻断未发布版本、下架已上线副本，并列出受影响渠道；
+* 平台迟到结算按结算日版本化汇率逐笔入账，锚定上线时冻结的分成规则，
+  外部流水重复到达不重复入账，退款/更正只能追加；
+* 授权撤回后的新增收入按收入周期末日判定并单独隔离；
+* 实收与应收差异超市场阈值自动建立争议、冻结可分配余额，
+  制作方与权利方分别批准后方可释放或凭更正闭环。
 """
 
 from datetime import date, datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP, getcontext
 from itertools import count
+
+getcontext().prec = 28
 
 # ---- 稳定枚举（与 fixtures/domain.json 保持一致语义） -----------------------
 
@@ -57,6 +65,25 @@ DEP_BLOCKED = "blocked"
 DEP_ONLINE = "online"
 DEP_TAKEN_DOWN = "taken_down"
 
+# ---- 结算与对账 -----------------------------------------------------------
+
+SETTLE_SALE = "sale"                 # 销售（正向收入）
+SETTLE_REFUND = "refund"             # 退款（负向，只能追加）
+SETTLE_ADJUSTMENT = "adjustment"     # 更正（金额可正可负，只能追加）
+SETTLE_KINDS = (SETTLE_SALE, SETTLE_REFUND, SETTLE_ADJUSTMENT)
+
+SETTLE_IMPORTED = "imported"         # 正常入账
+SETTLE_DUPLICATE = "duplicate"       # 外部流水重复到达
+SETTLE_QUARANTINED = "quarantined"   # 撤回边界后新增，隔离不参与分配
+
+DISPUTE_OPEN = "open"
+DISPUTE_APPROVED = "approved"        # 双批准完成，可释放/调整
+DISPUTE_RESOLVED = "resolved"        # 已凭更正闭环
+DISPUTE_REJECTED = "rejected"        # 双批准中出现拒绝，冻结不解除
+
+BASE_CURRENCY = "USD"                # 内部记账本位币
+MONEY_QUANT = Decimal("0.01")        # 货币金额最小单位
+
 
 class DomainError(Exception):
     """所有业务规则冲突的基类，HTTP 层据此映射状态码。"""
@@ -81,6 +108,22 @@ class ConflictError(DomainError):
     http_status = 409
 
 
+def _money(value):
+    """统一金额口径：字符串/数字/Decimal -> 两位小数 Decimal。"""
+    return Decimal(str(value)).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _money_str(value):
+    return str(_money(value))
+
+
+def _ratio(value):
+    ratio = Decimal(str(value))
+    if not 0 <= ratio <= 1:
+        raise DomainError("分成比例必须在 0 与 1 之间")
+    return ratio
+
+
 def _today():
     return date.today().isoformat()
 
@@ -101,7 +144,7 @@ class Domain:
 
     def __init__(self, now=None):
         self._now = now or _today
-        self._seq = count(1)
+        self._counter = 0
         self.ips = {}
         self.elements = {}              # element_key 在同一 IP 内唯一
         self.proposals = {}
@@ -118,11 +161,23 @@ class Domain:
         self.channels = {}
         self.deployments = {}
         self.withdrawals = []
+        # ---- 结算与对账 ----
+        self.fx_rates = {}              # (currency, settlement_date) -> rate
+        self.settlements = {}           # settlement_id -> 结算批次头
+        self.settlement_lines = {}      # line_id -> 结算行
+        self.external_refs = {}         # 外部流水标识 -> line_id（幂等键）
+        self.dispute_rules = {}         # market -> {"threshold","mode","absolute"}
+        self.disputes = {}              # dispute_id -> 争议
+        self.approvals = []             # 争议审批事件（追加）
+        self.corrections = []           # 退款/更正/再评等追加型账目事件
+        self.quarantine = []            # 撤回边界后的新增收入（隔离）
+        self.duplicate_imports = []     # 外部流水重放的审计痕迹
 
     # ---- 工具 -------------------------------------------------------------
 
     def _id(self, prefix):
-        return f"{prefix}_{next(self._seq):04d}"
+        self._counter += 1
+        return f"{prefix}_{self._counter:04d}"
 
     def now(self):
         value = self._now()
@@ -935,6 +990,32 @@ class Domain:
             basis = {"state": "已下架（冻结快照保留）", **frozen_dep["revenue_basis"]}
         else:
             basis = self._basis_draft(version, at)
+        market_totals = (self._market_totals(version["market"])
+                         if any("revenue_basis" in dep for dep in deps)
+                         else None)
+        dep_finance = []
+        for dep in deps:
+            receivable, received = self._deployment_diff(dep["id"])
+            dep_disputes = [
+                {"dispute_id": dsp["id"], "status": dsp["status"],
+                 "diff_base": str(dsp["diff_base"]), "frozen": dsp["frozen"]}
+                for dsp in self.disputes.values()
+                if dsp["deployment_id"] == dep["id"]]
+            dep_quarantine = [
+                self.settlement_lines[i]["external_ref"]
+                for i in self.quarantine
+                if self.settlement_lines[i]["deployment_id"] == dep["id"]]
+            dep_finance.append({
+                "deployment_id": dep["id"],
+                "receivable_base": str(receivable),
+                "received_base": str(received),
+                # 可支付是市场级口径：该市场存在未决/被拒争议则整体为 0
+                "payable_base": (market_totals["payable_base"]
+                                 if market_totals else "0.00"),
+                "market_frozen": market_totals["frozen"] if market_totals else False,
+                "disputes": dep_disputes,
+                "quarantined_refs": dep_quarantine,
+            })
         return {
             "version_id": version["id"],
             "code": version["code"],
@@ -949,6 +1030,7 @@ class Domain:
             "release_check": self.release_check(version["id"], at),
             "labor": self.labor_totals(version["id"]),
             "revenue_basis": basis,
+            "finance": dep_finance,
             "deployments": deps,
         }
 
@@ -968,3 +1050,742 @@ class Domain:
             "locked_hours": labor["hours"],
             "locked_labor_cost": labor["cost"],
         }
+
+    # ======================================================================
+    # 结算与对账：迟到结算、版本化汇率、追加型退款/更正、撤回隔离、
+    # 差异争议与双方批准、逐笔可追溯的应收/实收/可支付台账
+    # ======================================================================
+
+    # ---- 汇率（按结算日版本化） -------------------------------------------
+
+    def set_fx_rate(self, currency, rate, as_of, base_currency=BASE_CURRENCY):
+        """登记某结算日的汇率口径；一经结算行引用即冻结，不可改写。"""
+        currency = (currency or "").upper()
+        if not currency:
+            raise DomainError("币种不能为空")
+        if currency == base_currency:
+            raise DomainError(f"本位币 {base_currency} 无需登记汇率")
+        value = Decimal(str(rate))
+        if value <= 0:
+            raise DomainError("汇率必须为正数")
+        used = any((line.get("currency") == currency
+                    and line.get("settlement_date") == as_of)
+                   for line in self.settlement_lines.values())
+        if used:
+            raise ConflictError(
+                f"{currency} 在 {as_of} 的汇率已被结算行引用，不能改写；"
+                "汇率口径按结算日版本化，差异请走更正")
+        record = {
+            "currency": currency,
+            "base_currency": base_currency,
+            "rate": value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP),
+            "as_of": as_of,
+            "updated_at": self.now(),
+        }
+        self.fx_rates[(currency, as_of)] = record
+        return record
+
+    def _fx(self, currency, settlement_date):
+        currency = currency.upper()
+        if currency == BASE_CURRENCY:
+            return {"currency": BASE_CURRENCY, "base_currency": BASE_CURRENCY,
+                    "rate": Decimal("1"), "as_of": settlement_date}
+        record = self.fx_rates.get((currency, settlement_date))
+        if record is None:
+            raise DomainError(
+                f"缺少 {currency} 在结算日 {settlement_date} 的汇率口径",
+                code="MissingFxRate",
+                details={"currency": currency, "settlement_date": settlement_date})
+        return record
+
+    # ---- 差异阈值规则 ------------------------------------------------------
+
+    def set_dispute_rule(self, market, threshold=None, absolute=None):
+        """设置市场差异阈值：按应收比例 threshold 和/或本位币绝对额 absolute。
+
+        任一阈值被突破即自动建立争议。阈值在导入时按最新设置生效。
+        """
+        if threshold is None and absolute is None:
+            raise DomainError("差异规则至少给出 threshold（比例）或 absolute（本位币额）")
+        rule = {"market": market, "updated_at": self.now()}
+        if threshold is not None:
+            value = Decimal(str(threshold))
+            if not 0 < value:
+                raise DomainError("比例阈值必须为正数")
+            rule["threshold"] = value
+        if absolute is not None:
+            amount = _money(absolute)
+            if amount <= 0:
+                raise DomainError("绝对额阈值必须为正数")
+            rule["absolute"] = amount
+        self.dispute_rules[market] = rule
+        return rule
+
+    # ---- 冻结分成参与方与舍入分配 -----------------------------------------
+
+    def _frozen_participants(self, deployment):
+        """以副本上线时冻结的分成快照还原参与方；制作方取得剩余比例。"""
+        basis = deployment.get("revenue_basis")
+        if not basis:
+            raise DomainError("副本尚未发行，无冻结分成快照，不能接收结算")
+        participants, seen, rights_total = [], set(), Decimal("0")
+        for grant in basis.get("grants", []):
+            if grant.get("share_ratio") is None or grant["licensor"] in seen:
+                continue
+            seen.add(grant["licensor"])
+            ratio = _ratio(grant["share_ratio"])
+            rights_total += ratio
+            participants.append({
+                "party": grant["licensor"], "role": "权利方",
+                "grant_id": grant["grant_id"], "ratio": ratio,
+            })
+        if rights_total > 1:
+            raise DomainError(
+                "冻结分成比例之和超过 100%，无法分配",
+                code="ShareRatioOverflow",
+                details={"rights_total": str(rights_total)})
+        participants.append({
+            "party": "制作方", "role": "制作方", "grant_id": None,
+            "ratio": (Decimal("1") - rights_total).quantize(Decimal("0.000001")),
+        })
+        return participants, basis.get("frozen_at")
+
+    @staticmethod
+    def _allocate(base_amount, participants):
+        """按冻结比例把实收（本位币）分到各方。
+
+        权利方份额各自四舍五入到分；跨币种/比例舍入产生的尾差全部由
+        制作方吸收，保证逐行各方金额之和与实收精确相等。
+        """
+        total_cents = int((base_amount * 100).to_integral_value(
+            rounding=ROUND_HALF_UP))
+        sign = -1 if total_cents < 0 else 1
+        total_cents_abs = abs(total_cents)
+        shares, rights_cents = [], 0
+        rights = sorted(
+            (p for p in participants if p["role"] == "权利方"),
+            key=lambda p: p["party"])
+        for party in rights:
+            raw = (base_amount * party["ratio"])
+            cents = int((abs(raw) * 100).to_integral_value(rounding=ROUND_HALF_UP))
+            cents *= sign
+            rights_cents += cents
+            shares.append({
+                "party": party["party"], "role": "权利方",
+                "grant_id": party["grant_id"],
+                "ratio": str(party["ratio"]),
+                "raw_amount": str(raw.quantize(Decimal("0.000001"))),
+                "amount": str((Decimal(cents) / 100).quantize(MONEY_QUANT)),
+            })
+        producer = next(p for p in participants if p["role"] == "制作方")
+        producer_raw = base_amount * producer["ratio"]
+        producer_cents = total_cents - rights_cents
+        shares.append({
+            "party": "制作方", "role": "制作方", "grant_id": None,
+            "ratio": str(producer["ratio"]),
+            "raw_amount": str(producer_raw.quantize(Decimal("0.000001"))),
+            "amount": str((Decimal(producer_cents) / 100).quantize(MONEY_QUANT)),
+            "rounding_absorbed": str(
+                (Decimal(producer_cents) / 100).quantize(MONEY_QUANT)
+                - producer_raw.quantize(MONEY_QUANT)),
+        })
+        allocated = sum(Decimal(s["amount"]) for s in shares)
+        assert allocated == base_amount, (allocated, base_amount)
+        return shares
+
+    # ---- 撤回边界 ----------------------------------------------------------
+
+    def _withdrawal_boundary(self, ip_id, market):
+        rows = [g for g in self.grants.values()
+                if g["ip_id"] == ip_id and g["market"] == market
+                and g["status"] == GRANT_WITHDRAWN]
+        if not rows:
+            return None, []
+        boundary = min(g["withdrawn_at"] for g in rows)
+        grants = sorted(({"grant_id": g["id"], "licensor": g["licensor"],
+                          "withdrawn_at": g["withdrawn_at"]}
+                         for g in rows), key=lambda x: x["grant_id"])
+        return boundary, grants
+
+    # ---- 结算行导入（幂等、隔离、分配、争议） -----------------------------
+
+    def _normalize_kind_amount(self, kind, gross):
+        if kind not in SETTLE_KINDS:
+            raise DomainError(
+                f"结算行类型只能是 {', '.join(SETTLE_KINDS)}")
+        amount = Decimal(str(gross))
+        if amount == 0:
+            raise DomainError("结算金额不能为 0")
+        if kind == SETTLE_SALE and amount < 0:
+            raise DomainError("销售行金额必须为正；负数请走 refund 或 adjustment")
+        if kind == SETTLE_REFUND:
+            amount = -abs(amount)     # 退款一律按负向追加
+        return _money(amount)
+
+    def import_settlement(self, channel_code, lines, settlement_date,
+                          batch_ref="", at=None):
+        """导入平台结算批次。同一外部流水重复到达只入账一次。
+
+        每行关联已发行副本及其上线时冻结的分成规则；撤回边界之后的新增
+        收入进入隔离；实收与应收差异超阈值时自动建争议并冻结该市场。
+        """
+        channel = self._get(self.channels, channel_code, "发行渠道")
+        if not isinstance(lines, (list, tuple)) or not lines:
+            raise DomainError("结算批次至少包含一行")
+        at = at or self.now()
+        # 批次具备原子性：任一行失败，回滚本批次已写的全部账目与争议变更
+        backup = self._finance_backup()
+        batch = {
+            "id": self._id("set"),
+            "channel_code": channel_code,
+            "market": channel["market"],
+            "settlement_date": settlement_date,
+            "batch_ref": batch_ref,
+            "imported_at": at,
+            "line_ids": [],
+            "correction": False,
+        }
+        self.settlements[batch["id"]] = batch
+        results = []
+        try:
+            for raw in lines:
+                result = self._import_line(batch, raw, settlement_date, at)
+                if result.get("line_id"):
+                    batch["line_ids"].append(result["line_id"])
+                results.append(result)
+        except BaseException:
+            self._finance_restore(backup)
+            raise
+        totals = self._market_totals(channel["market"])
+        return {
+            "batch_id": batch["id"],
+            "channel_code": channel_code,
+            "market": channel["market"],
+            "settlement_date": settlement_date,
+            "results": results,
+            "market_totals": totals,
+        }
+
+    def _import_line(self, batch, raw, settlement_date, at,
+                     evaluate_dispute=True):
+        external_ref = raw.get("external_ref")
+        if not external_ref:
+            raise DomainError("结算行必须带 external_ref 外部流水标识")
+        duplicate_of = self.external_refs.get(external_ref)
+        if duplicate_of is not None:
+            # 外部流水重放：不新建账目不重新分配，只留下审计痕迹
+            hit = {"external_ref": external_ref, "line_id": duplicate_of,
+                   "batch_id": batch["id"], "at": at}
+            self.duplicate_imports.append(hit)
+            return {"external_ref": external_ref, "status": SETTLE_DUPLICATE,
+                    "line_id": duplicate_of, "rejected_batch_id": batch["id"]}
+
+        deployment_id = raw.get("deployment_id")
+        deployment = self._get(self.deployments, deployment_id, "发行副本")
+        if deployment["channel_code"] != batch["channel_code"]:
+            raise DomainError(
+                f"结算行渠道 {batch['channel_code']} 与副本发行渠道 "
+                f"{deployment['channel_code']} 不一致",
+                details={"external_ref": external_ref})
+        version = self.versions[deployment["version_id"]]
+        market = version["market"]
+        if market != batch["market"]:
+            raise DomainError("结算行市场与副本市场不一致")
+
+        kind = raw.get("kind", SETTLE_SALE)
+        gross = self._normalize_kind_amount(kind, raw.get("gross"))
+        currency = (raw.get("currency") or BASE_CURRENCY).upper()
+        report = (raw.get("report_amount") if raw.get("report_amount") is not None
+                  else gross)
+        report = _money(report)
+        if kind == SETTLE_REFUND:
+            report = -abs(report)
+
+        period_start = raw.get("period_start") or ""
+        period_end = raw.get("period_end") or period_start
+        if period_start and period_end and period_end < period_start:
+            raise DomainError("结算周期结束日不能早于开始日")
+
+        fx = self._fx(currency, settlement_date)
+        base_amount = (gross * fx["rate"]).quantize(MONEY_QUANT,
+                                                    rounding=ROUND_HALF_UP)
+        report_base = (report * fx["rate"]).quantize(MONEY_QUANT,
+                                                     rounding=ROUND_HALF_UP)
+
+        ip_id = self._version_ip(version)
+        boundary, withdrawn_grants = self._withdrawal_boundary(ip_id, market)
+        revenue_end = period_end or period_start or settlement_date
+        quarantined = bool(boundary and revenue_end >= boundary)
+
+        line = {
+            "id": self._id("line"),
+            "batch_id": batch["id"],
+            "external_ref": external_ref,
+            "channel_code": batch["channel_code"],
+            "market": market,
+            "deployment_id": deployment_id,
+            "version_id": version["id"],
+            "version_code": version["code"],
+            "kind": kind,
+            "status": SETTLE_QUARANTINED if quarantined else SETTLE_IMPORTED,
+            "currency": currency,
+            "gross_amount": gross,                 # 实收（原币，带符号）
+            "report_amount": report,              # 应收（平台报表口径）
+            "fx": {"rate": fx["rate"], "as_of": fx["as_of"],
+                   "base_currency": fx["base_currency"]},
+            "base_amount": base_amount,           # 实收本位币
+            "report_base": report_base,           # 应收本位币
+            "settlement_date": settlement_date,
+            "period_start": period_start,
+            "period_end": period_end,
+            "withdrawn_boundary": boundary,
+            "withdrawn_grants": withdrawn_grants,
+            "shares": [],
+            "dispute_ids": [],
+            "note": raw.get("note", ""),
+            "received_at": at,
+        }
+
+        if quarantined:
+            # 撤回生效后的新增收入：只登记隔离，不分配、不入可支付余额
+            line["quarantine_reason"] = (
+                f"收入周期末日 {revenue_end} 不早于授权撤回边界 {boundary}")
+            self.quarantine.append(line["id"])
+        else:
+            participants, frozen_at = self._frozen_participants(deployment)
+            line["shares"] = self._allocate(base_amount, participants)
+            line["basis_frozen_at"] = frozen_at
+
+        self.settlement_lines[line["id"]] = line
+        self.external_refs[external_ref] = line["id"]
+
+        dispute_id = None
+        if not quarantined and evaluate_dispute:
+            dispute_id = self._evaluate_dispute(line, at)
+        return {
+            "external_ref": external_ref,
+            "status": line["status"],
+            "line_id": line["id"],
+            "deployment_id": deployment_id,
+            "base_amount": str(base_amount),
+            "quarantined": quarantined,
+            "dispute_id": dispute_id,
+        }
+
+    # ---- 差异争议与双批准 -------------------------------------------------
+
+    def _normal_lines(self, deployment_id):
+        return [ln for ln in self.settlement_lines.values()
+                if ln["deployment_id"] == deployment_id
+                and ln["status"] == SETTLE_IMPORTED]
+
+    def _deployment_diff(self, deployment_id):
+        lines = self._normal_lines(deployment_id)
+        receivable = sum((ln["report_base"] for ln in lines), Decimal("0"))
+        received = sum((ln["base_amount"] for ln in lines), Decimal("0"))
+        return receivable.quantize(MONEY_QUANT), received.quantize(MONEY_QUANT)
+
+    def _rule_breached(self, market, receivable, received):
+        rule = self.dispute_rules.get(market)
+        if rule is None:
+            return None
+        diff = receivable - received
+        breaches = []
+        if "threshold" in rule and receivable > 0:
+            ratio = abs(diff) / receivable
+            if ratio >= rule["threshold"]:
+                breaches.append({"type": "ratio", "limit": str(rule["threshold"]),
+                                 "actual": str(ratio.quantize(Decimal("0.000001")))})
+        if "absolute" in rule and abs(diff) >= rule["absolute"]:
+            breaches.append({"type": "absolute", "limit": str(rule["absolute"]),
+                             "actual": str(abs(diff))})
+        return {"diff": diff.quantize(MONEY_QUANT), "breaches": breaches} \
+            if breaches else None
+
+    def _evaluate_dispute(self, line, at):
+        deployment_id = line["deployment_id"]
+        market = line["market"]
+        receivable, received = self._deployment_diff(deployment_id)
+        open_dispute = next(
+            (dsp for dsp in self.disputes.values()
+             if dsp["deployment_id"] == deployment_id
+             and dsp["status"] in (DISPUTE_OPEN, DISPUTE_REJECTED)), None)
+        breach = self._rule_breached(market, receivable, received)
+        if open_dispute is not None:
+            # 已开争议：迟到结算即使把差异补齐也维持冻结，释放仍须双批准；
+            # 差异重新扩大时刷新超限口径。
+            open_dispute["line_ids"].append(line["id"])
+            open_dispute["receivable_base"] = receivable
+            open_dispute["received_base"] = received
+            open_dispute["diff_base"] = (receivable - received).quantize(MONEY_QUANT)
+            if breach is not None:
+                open_dispute["breaches"] = breach["breaches"]
+            if open_dispute["id"] not in line["dispute_ids"]:
+                line["dispute_ids"].append(open_dispute["id"])
+            return open_dispute["id"]
+        if breach is None:
+            return None
+        dispute = {
+            "id": self._id("dsp"),
+            "market": market,
+            "deployment_id": deployment_id,
+            "version_id": line["version_id"],
+            "channel_code": line["channel_code"],
+            "opened_at": at,
+            "status": DISPUTE_OPEN,
+            "receivable_base": receivable,
+            "received_base": received,
+            "diff_base": breach["diff"],
+            "breaches": breach["breaches"],
+            "line_ids": [line["id"]],
+            "approvals": {"producer": None, "rights": None},
+            "frozen": True,
+            "resolved_at": None,
+            "resolution_line_id": None,
+        }
+        self.disputes[dispute["id"]] = dispute
+        line["dispute_ids"].append(dispute["id"])
+        return dispute["id"]
+
+    def approve_dispute(self, dispute_id, role, approver, decision="approve",
+                        note="", at=None):
+        """制作方与权利方分别表态；双方最新表态均为批准才释放市场余额。
+
+        任一方拒绝即维持冻结；拒绝方随后改投批准可翻案，双方一致即释放。
+        """
+        dispute = self._get(self.disputes, dispute_id, "争议")
+        if role not in ("producer", "rights"):
+            raise DomainError("批准角色只能是 producer（制作方）或 rights（权利方）")
+        if decision not in ("approve", "reject"):
+            raise DomainError("决定只能是 approve 或 reject")
+        if dispute["status"] not in (DISPUTE_OPEN, DISPUTE_REJECTED):
+            raise ConflictError(f"争议已处于 {dispute['status']} 状态，不能再批准")
+        event = {"dispute_id": dispute_id, "role": role, "approver": approver,
+                 "decision": decision, "note": note, "at": at or self.now()}
+        self.approvals.append(event)
+        dispute["approvals"][role] = event
+        approved_by_all = all(
+            dispute["approvals"][r] is not None
+            and dispute["approvals"][r]["decision"] == "approve"
+            for r in ("producer", "rights"))
+        if approved_by_all:
+            dispute["status"] = DISPUTE_APPROVED
+            dispute["approved_at"] = event["at"]
+            dispute["frozen"] = False
+        else:
+            # 仍有任一方未批准或最新表态为拒绝：维持冻结/被拒状态
+            dispute["status"] = (DISPUTE_REJECTED
+                                 if decision == "reject"
+                                 or any(dispute["approvals"][r] is not None
+                                        and dispute["approvals"][r]["decision"] == "reject"
+                                        for r in ("producer", "rights"))
+                                 else DISPUTE_OPEN)
+            dispute["frozen"] = True
+        return dispute
+
+    def append_correction(self, deployment_id, external_ref, kind, gross,
+                          currency, settlement_date, report_amount=None,
+                          period_start="", period_end="", note="",
+                          dispute_id=None, at=None):
+        """退款/更正只能追加；引用争议时必须先经双方批准。
+
+        批准后的更正若把累计差异带回阈值内，争议闭环并彻底释放。
+        """
+        deployment = self._get(self.deployments, deployment_id, "发行副本")
+        channel_code = deployment["channel_code"]
+        dispute = None
+        if dispute_id is not None:
+            dispute = self._get(self.disputes, dispute_id, "争议")
+            if dispute["deployment_id"] != deployment_id:
+                raise DomainError("更正与争议不属于同一发行副本")
+            if dispute["status"] == DISPUTE_OPEN:
+                raise ConflictError(
+                    "争议尚未取得制作方与权利方双批准，不能调整；"
+                    "退款与更正已可先行登记，但调整争议须等批准")
+            if dispute["status"] != DISPUTE_APPROVED:
+                raise ConflictError(f"争议状态为 {dispute['status']}，不能追加调整")
+        at = at or self.now()
+        backup = self._finance_backup()
+        batch = {
+            "id": self._id("set"),
+            "channel_code": channel_code,
+            "market": self.versions[deployment["version_id"]]["market"],
+            "settlement_date": settlement_date,
+            "batch_ref": f"correction:{external_ref}",
+            "imported_at": at,
+            "line_ids": [],
+            "correction": True,
+        }
+        self.settlements[batch["id"]] = batch
+        raw = {"deployment_id": deployment_id, "external_ref": external_ref,
+               "kind": kind, "gross": gross, "currency": currency,
+               "report_amount": report_amount, "period_start": period_start,
+               "period_end": period_end, "note": note}
+        # 更正行不参与自动开争议；由本方法在双批准前提下统一重评
+        try:
+            result = self._import_line(batch, raw, settlement_date, at,
+                                       evaluate_dispute=False)
+        except BaseException:
+            self._finance_restore(backup)
+            raise
+        self.corrections.append({"line_id": result.get("line_id"),
+                                 "dispute_id": dispute_id, "at": at})
+        if dispute is None or not result.get("line_id"):
+            return {"batch_id": batch["id"], "result": result,
+                    "dispute_id": dispute_id, "dispute_status": None}
+        if result.get("quarantined"):
+            # 撤回边界后的金额只进隔离区，不冲减争议差异
+            return {"batch_id": batch["id"], "result": result,
+                    "dispute_id": dispute_id, "dispute_status": dispute["status"],
+                    "quarantined": True}
+        receivable, received = self._deployment_diff(deployment_id)
+        dispute["receivable_base"] = receivable
+        dispute["received_base"] = received
+        dispute["diff_base"] = (receivable - received).quantize(MONEY_QUANT)
+        breach = self._rule_breached(dispute["market"], receivable, received)
+        if breach is None:
+            dispute["status"] = DISPUTE_RESOLVED
+            dispute["resolved_at"] = at
+            dispute["resolution_line_id"] = result["line_id"]
+            dispute["frozen"] = False
+            dispute["breaches"] = []
+            outcome = "resolved"
+        else:
+            # 更正后仍超阈值：争议重开，恢复冻结，双方须重新批准
+            dispute["status"] = DISPUTE_OPEN
+            dispute["frozen"] = True
+            dispute["breaches"] = breach["breaches"]
+            dispute["approvals"] = {"producer": None, "rights": None}
+            dispute["reopened_at"] = at
+            dispute["reopen_line_id"] = result["line_id"]
+            outcome = "reopened"
+        return {"batch_id": batch["id"], "result": result,
+                "dispute_id": dispute_id, "dispute_status": dispute["status"],
+                "outcome": outcome,
+                "receivable_base": str(receivable),
+                "received_base": str(received)}
+
+    # ---- 台账与逐笔追溯 ----------------------------------------------------
+
+    def _market_frozen(self, market):
+        # 未决争议或被任一方拒绝的争议都维持冻结；只有双批准/闭环才释放
+        return any(dsp["market"] == market
+                   and dsp["status"] in (DISPUTE_OPEN, DISPUTE_REJECTED)
+                   for dsp in self.disputes.values())
+
+    def _market_totals(self, market):
+        lines = [ln for ln in self.settlement_lines.values()
+                 if ln["market"] == market and ln["status"] == SETTLE_IMPORTED]
+        receivable = sum((ln["report_base"] for ln in lines), Decimal("0"))
+        received = sum((ln["base_amount"] for ln in lines), Decimal("0"))
+        parties = {}
+        currencies = {}
+        for ln in lines:
+            currencies[ln["currency"]] = currencies.get(ln["currency"], Decimal("0")) \
+                + ln["gross_amount"]
+            for share in ln["shares"]:
+                slot = parties.setdefault(
+                    share["party"],
+                    {"role": share["role"], "amount": Decimal("0")})
+                slot["amount"] += Decimal(share["amount"])
+        frozen = self._market_frozen(market)
+        return {
+            "market": market,
+            "receivable_base": str(receivable.quantize(MONEY_QUANT)),
+            "received_base": str(received.quantize(MONEY_QUANT)),
+            "distributable_base": str(received.quantize(MONEY_QUANT)),
+            "payable_base": "0.00" if frozen
+            else str(received.quantize(MONEY_QUANT)),
+            "frozen": frozen,
+            "currency_breakdown": {code: str(amount.quantize(MONEY_QUANT))
+                                   for code, amount in sorted(currencies.items())},
+            "participants": {
+                name: {"role": slot["role"],
+                       "amount": str(slot["amount"].quantize(MONEY_QUANT))}
+                for name, slot in sorted(parties.items())},
+        }
+
+    def _line_brief(self, line):
+        return {
+            "line_id": line["id"], "external_ref": line["external_ref"],
+            "batch_id": line["batch_id"], "kind": line["kind"],
+            "status": line["status"],
+            "deployment_id": line["deployment_id"],
+            "version_code": line["version_code"],
+            "currency": line["currency"],
+            "gross_amount": str(line["gross_amount"]),
+            "report_amount": str(line["report_amount"]),
+            "fx_as_of": line["fx"]["as_of"], "fx_rate": str(line["fx"]["rate"]),
+            "base_amount": str(line["base_amount"]),
+            "report_base": str(line["report_base"]),
+            "settlement_date": line["settlement_date"],
+            "period": [line["period_start"], line["period_end"]],
+            "dispute_ids": list(line["dispute_ids"]),
+        }
+
+    def settlement_report(self, settlement_id):
+        """一个结算批次的逐行明细：每行都能追到副本、冻结快照与分成。"""
+        batch = self._get(self.settlements, settlement_id, "结算批次")
+        lines = [self.settlement_lines[i] for i in batch["line_ids"]]
+        return {
+            "batch": {k: v for k, v in batch.items()},
+            "lines": [self._line_brief(ln) for ln in lines],
+        }
+
+    def line_trace(self, line_id):
+        """逐笔追溯：外部流水 -> 结算行 -> 发行副本 -> 冻结分成 -> 台账累计。"""
+        line = self._get(self.settlement_lines, line_id, "结算行")
+        deployment = self.deployments[line["deployment_id"]]
+        version = self.versions[line["version_id"]]
+        receivable, received = self._deployment_diff(line["deployment_id"])
+        participants, frozen_at = self._frozen_participants(deployment)
+        market = self._market_totals(line["market"])
+        return {
+            "line": self._line_brief(line),
+            "path": {
+                "channel_code": deployment["channel_code"],
+                "deployment_id": deployment["id"],
+                "deployment_status": deployment["status"],
+                "released_at": deployment.get("released_at"),
+                "version_id": version["id"],
+                "version_code": version["code"],
+                "market": version["market"],
+                "basis_frozen_at": frozen_at,
+                "frozen_grants": deployment["revenue_basis"]["grants"],
+                "locked_labor_cost":
+                    deployment["revenue_basis"]["locked_labor_cost"],
+            },
+            "fx_version": line["fx"],
+            "shares": line["shares"] if line["status"] == SETTLE_IMPORTED
+            else [],
+            "ledger": {
+                "scope": "deployment",
+                "receivable_base": str(receivable),
+                "received_base": str(received),
+                "payable_base": market["payable_base"],
+                "market_frozen": market["frozen"],
+                "quarantined": line["status"] == SETTLE_QUARANTINED,
+            },
+            "quarantine": {
+                "active": line["status"] == SETTLE_QUARANTINED,
+                "boundary": line.get("withdrawn_boundary"),
+                "grants": line.get("withdrawn_grants", []),
+                "reason": line.get("quarantine_reason", ""),
+            },
+        }
+
+    def finance_report(self, market=None, at=None):
+        """财务总账：分市场应收/实收/可支付、争议、隔离与汇率版本。"""
+        markets = sorted({ln["market"] for ln in self.settlement_lines.values()}
+                         | set(self.dispute_rules))
+        if market is not None:
+            markets = [m for m in markets if m == market]
+        deployment_rows = []
+        for dep_id, dep in sorted(self.deployments.items()):
+            lines = self._normal_lines(dep_id)
+            if not lines and not any(
+                    ln["deployment_id"] == dep_id
+                    for ln in self.settlement_lines.values()):
+                continue
+            version = self.versions[dep["version_id"]]
+            receivable, received = self._deployment_diff(dep_id)
+            deployment_rows.append({
+                "deployment_id": dep_id,
+                "version_id": version["id"],
+                "version_code": version["code"],
+                "market": version["market"],
+                "channel_code": dep["channel_code"],
+                "deployment_status": dep["status"],
+                "lines": len(lines),
+                "receivable_base": str(receivable),
+                "received_base": str(received),
+                "frozen_basis": dep.get("revenue_basis"),
+            })
+        return {
+            "generated_at": at or self.now(),
+            "base_currency": BASE_CURRENCY,
+            "markets": {m: self._market_totals(m) for m in markets},
+            "deployments": deployment_rows,
+            "disputes": [dsp for dsp in
+                         sorted(self.disputes.values(),
+                                key=lambda d: d["opened_at"])
+                         if market is None or dsp["market"] == market],
+            "quarantined_lines": [
+                self._line_brief(self.settlement_lines[i])
+                for i in self.quarantine
+                if market is None
+                or self.settlement_lines[i]["market"] == market],
+            "duplicate_imports": list(self.duplicate_imports),
+            "fx_versions": [
+                {"currency": k[0], "as_of": k[1],
+                 "rate": str(rec["rate"]), "base_currency": rec["base_currency"]}
+                for k, rec in sorted(self.fx_rates.items())],
+        }
+
+    # ---- 快照/恢复（重启后再次导入账目一致） ------------------------------
+
+    _FINANCE_STORES = (
+        "settlements", "settlement_lines", "external_refs", "disputes",
+        "approvals", "corrections", "quarantine", "duplicate_imports")
+
+    def _finance_backup(self):
+        from copy import deepcopy
+        return {"_counter": self._counter,
+                **{name: deepcopy(getattr(self, name))
+                   for name in self._FINANCE_STORES}}
+
+    def _finance_restore(self, backup):
+        self._counter = backup["_counter"]
+        for name in self._FINANCE_STORES:
+            setattr(self, name, backup[name])
+
+    def snapshot(self):
+        return _freeze({k: v for k, v in self.__dict__.items()
+                        if k != "_now"})
+
+    def load_state(self, state):
+        data = _thaw(state)
+        self._counter = int(data.get("_counter", 0))
+        for name in (
+                "ips", "elements", "proposals", "versions", "licenses",
+                "grants", "teams", "assets", "assignments", "worklogs",
+                "deliveries", "reviews", "ratings", "channels", "deployments",
+                "withdrawals", "fx_rates", "settlements", "settlement_lines",
+                "external_refs", "dispute_rules", "disputes", "approvals",
+                "corrections", "quarantine", "duplicate_imports"):
+            setattr(self, name, data.get(name, _empty_default(name)))
+        return self
+
+
+def _empty_default(name):
+    return [] if name in ("withdrawals", "approvals", "corrections",
+                          "quarantine", "duplicate_imports") else {}
+
+
+def _freeze(obj):
+    if isinstance(obj, Decimal):
+        return {"__decimal__": str(obj)}
+    if isinstance(obj, dict):
+        if any(isinstance(k, tuple) for k in obj):
+            return {"__pairs__": [
+                [list(k) if isinstance(k, tuple) else k, _freeze(v)]
+                for k, v in obj.items()]}
+        return {k: _freeze(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_freeze(v) for v in obj]
+    return obj
+
+
+def _thaw(obj):
+    if isinstance(obj, dict):
+        if "__decimal__" in obj:
+            return Decimal(obj["__decimal__"])
+        if "__pairs__" in obj:
+            restored = {}
+            for key, value in obj["__pairs__"]:
+                restored[tuple(key) if isinstance(key, list) else key] = _thaw(value)
+            return restored
+        return {k: _thaw(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_thaw(v) for v in obj]
+    return obj

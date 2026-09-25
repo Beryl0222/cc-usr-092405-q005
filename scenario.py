@@ -10,8 +10,13 @@
 6. 跨时区重复交付（莫斯科/北京同哈希）只入账一次；
 7. 发行前撤权：准确阻断未发布版本并指出受影响渠道；
 8. 上线后撤权：在线副本下架，收益依据保留为上线时冻结快照；
-9. 管理看板：各市场成片、未决阻塞、收益分配依据、撤权波及的每个副本。
+9. 管理看板：各市场成片、未决阻塞、收益分配依据、撤权波及的每个副本；
+10. 迟到结算与对账：按结算日版本化汇率、多市场/渠道/币种拆笔、
+    外部流水幂等、退款/更正追加、撤回边界隔离、差异争议双批准与闭环，
+    以及"重启后再次导入"逐分一致。
 """
+
+from decimal import Decimal
 
 from domain import (
     Domain,
@@ -301,8 +306,174 @@ def run():
     frozen = ru_after["deployments"][0]["revenue_basis"]
 
     dashboard = d.dashboard(at=T_WITHDRAW_AFTER)
+
+    # ======================================================================
+    # 13. 结算与对账：晚于发行批次到达、按市场/渠道/币种拆笔、
+    #     版本化汇率、短款争议双批准、退款更正追加、撤回边界隔离、
+    #     外部流水幂等，以及"重启后再次导入"账目核对
+    # ======================================================================
+    dep_us = next(dep["id"] for dep in d.deployments.values()
+                  if dep["version_id"] == v_us2 and dep["status"] == DEP_ONLINE)
+    dep_kr = next(dep["id"] for dep in d.deployments.values()
+                  if dep["version_id"] == versions["KR"]["id"]
+                  and dep["status"] == DEP_ONLINE)
+    dep_ru = next(dep["id"] for dep in d.deployments.values()
+                  if dep["version_id"] == versions["RU"]["id"]
+                  and dep["status"] == DEP_TAKEN_DOWN)
+
+    # 差异阈值：US/KR/RU 分市场设置（比例或绝对额任一突破即建争议）
+    d.set_dispute_rule("US", threshold=0.1, absolute="20.00")
+    d.set_dispute_rule("KR", threshold=0.05, absolute="50.00")
+    d.set_dispute_rule("RU", threshold=0.1, absolute="50.00")
+
+    # 汇率口径按结算日版本化：迟到批次适用到达当日的汇率
+    d.set_fx_rate("EUR", "1.08", "2026-10-20")
+    d.set_fx_rate("KRW", "0.00072", "2026-10-18")
+    d.set_fx_rate("KRW", "0.00071", "2026-11-20")
+    d.set_fx_rate("RUB", "0.0110", "2026-10-20")
+    d.set_fx_rate("RUB", "0.0105", "2026-11-15")
+
+    # ---- 13a. US：同一版本按渠道/币种拆两笔，且实收短款 ----------------
+    us_batch = step(
+        "US 平台 10 月结算（USD 订阅 + EUR 区两笔；应收 1108，实收 808）",
+        d.import_settlement("us-pix", [
+            {"deployment_id": dep_us, "external_ref": "PIX-2026-09-US-USD",
+             "kind": "sale", "gross": "700.00", "currency": "USD",
+             "report_amount": "1000.00",
+             "period_start": "2026-09-01", "period_end": "2026-09-30",
+             "note": "美国区订阅分成"},
+            {"deployment_id": dep_us, "external_ref": "PIX-2026-09-US-EUR",
+             "kind": "sale", "gross": "100.00", "currency": "EUR",
+             "report_amount": "100.00",
+             "period_start": "2026-09-01", "period_end": "2026-09-30",
+             "note": "欧元区漫游收入，按结算日汇率折 USD"},
+        ], "2026-10-20", batch_ref="PIX/2026-09"))
+    us_dispute_id = us_batch["results"][0]["dispute_id"]
+    assert us_dispute_id, "短款 300/1108 超阈值，应自动建立争议"
+    assert us_batch["market_totals"]["frozen"]
+    assert us_batch["market_totals"]["payable_base"] == "0.00"
+
+    # 外部流水重复到达（平台重试推送）：不重复入账
+    us_replay = step(
+        "US 平台重推同一外部流水（判重，账目不变）",
+        d.import_settlement("us-pix", [
+            {"deployment_id": dep_us, "external_ref": "PIX-2026-09-US-USD",
+             "gross": "700.00", "currency": "USD",
+             "report_amount": "1000.00", "period_end": "2026-09-30"}],
+            "2026-10-20"))
+    assert us_replay["results"][0]["status"] == "duplicate"
+
+    # 制作方与权利方分别批准：缺一方不释放
+    d.approve_dispute(us_dispute_id, "producer", "国际制片主管",
+                      note="认可平台账期解释，先释放再追补")
+    assert d._market_totals("US")["frozen"]
+    step("权利方批准 US 短款争议（双方齐备，解除市场冻结）",
+         d.approve_dispute(us_dispute_id, "rights", "长河小说版权",
+                           note="同意按补付计划跟进"))
+    assert not d._market_totals("US")["frozen"]
+
+    # 迟到的补付更正批次（11 月才到）：只能追加；差异归零，争议闭环
+    us_topup = step(
+        "US 平台 11 月补付 300 USD（追加更正，争议闭环并最终释放）",
+        d.append_correction(dep_us, "PIX-2026-11-TOPUP", "adjustment",
+                            "300.00", "USD", "2026-11-25",
+                            report_amount="0.00",
+                            period_start="2026-09-01",
+                            period_end="2026-09-30",
+                            dispute_id=us_dispute_id,
+                            note="9 月短款补付"))
+    assert us_topup["outcome"] == "resolved"
+    us_totals = d._market_totals("US")
+    assert us_totals["receivable_base"] == "1108.00"
+    assert us_totals["received_base"] == "1108.00"
+    assert us_totals["payable_base"] == "1108.00"
+
+    # ---- 13b. KR：外币两笔 + 迟到退款批次（新汇率版本） -----------------
+    kr_batch = step(
+        "KR 平台 10 月结算（订阅/广告两笔 KRW，按 10 月汇率折 USD 1080）",
+        d.import_settlement("kr-wave", [
+            {"deployment_id": dep_kr, "external_ref": "WAVE-09-SUB",
+             "gross": "900000", "currency": "KRW", "report_amount": "900000",
+             "period_start": "2026-09-01", "period_end": "2026-09-30"},
+            {"deployment_id": dep_kr, "external_ref": "WAVE-09-AD",
+             "gross": "600000", "currency": "KRW", "report_amount": "600000",
+             "period_start": "2026-09-01", "period_end": "2026-09-30"},
+        ], "2026-10-18"))
+    assert kr_batch["market_totals"]["received_base"] == "1080.00"
+    kr_refund = step(
+        "KR 11 月迟到退款（按 11 月汇率版本，负向追加并配平到分）",
+        d.append_correction(dep_kr, "WAVE-11-REFUND-01", "refund",
+                            "10000", "KRW", "2026-11-20",
+                            report_amount="0",
+                            period_start="2026-09-01",
+                            period_end="2026-09-30",
+                            note="9 月订阅退款"))
+    kr_refund_line = d.settlement_lines[kr_refund["result"]["line_id"]]
+    assert kr_refund_line["base_amount"] == Decimal("-7.10")
+    assert sum(Decimal(s["amount"]) for s in kr_refund_line["shares"]) \
+        == Decimal("-7.10")
+
+    # ---- 13c. RU：撤回边界前/边界/后的收入分流 --------------------------
+    ru_batch = step(
+        "RU 平台迟到结算：撤回日（09-22）之前周期正常入账",
+        d.import_settlement("ru-stream", [
+            {"deployment_id": dep_ru, "external_ref": "RU-09-PRE",
+             "gross": "50000", "currency": "RUB", "report_amount": "50000",
+             "period_start": "2026-09-01", "period_end": "2026-09-21"}],
+            "2026-10-20"))
+    assert ru_batch["results"][0]["status"] == "imported"
+    ru_split = step(
+        "RU 同一周期跨撤回日及撤回后收入：逐笔隔离，不进可分配余额",
+        d.import_settlement("ru-stream", [
+            {"deployment_id": dep_ru, "external_ref": "RU-09-EDGE",
+             "gross": "4000", "currency": "RUB", "report_amount": "4000",
+             "period_start": "2026-09-20", "period_end": "2026-09-22"},
+            {"deployment_id": dep_ru, "external_ref": "RU-09-POST",
+             "gross": "9000", "currency": "RUB", "report_amount": "9000",
+             "period_start": "2026-09-23", "period_end": "2026-09-30"}],
+            "2026-10-20"))
+    assert [r["status"] for r in ru_split["results"]] == [
+        "quarantined", "quarantined"]
+    ru_late = step(
+        "RU 11 月才到的撤回前尾款（适用 11 月新汇率，仍正常入账）",
+        d.import_settlement("ru-stream", [
+            {"deployment_id": dep_ru, "external_ref": "RU-09-PRE-LATE",
+             "gross": "20000", "currency": "RUB", "report_amount": "20000",
+             "period_start": "2026-09-01", "period_end": "2026-09-21"}],
+            "2026-11-15"))
+    assert ru_late["results"][0]["status"] == "imported"
+    assert ru_late["results"][0]["base_amount"] == "210.00"
+    ru_totals = d._market_totals("RU")
+    assert ru_totals["received_base"] == "760.00"      # 550 + 210
+    assert ru_totals["payable_base"] == "760.00"
+
+    # 逐笔追溯：从外部流水一路追到版本、冻结分成与可支付余额
+    trace_us = d.line_trace(us_batch["results"][0]["line_id"])
+    trace_ru = d.line_trace(ru_late["results"][0]["line_id"])
+    assert trace_us["path"]["version_code"] == "SL-US-v2"
+    assert len(trace_ru["path"]["frozen_grants"]) == 2  # 小说方+音乐方
+
+    # ---- 13d. 重启后再次导入：去重与账目逐分一致 ------------------------
+    finance_before = d.finance_report()
+    restarted = Domain(now=clock).load_state(d.snapshot())
+    for channel, refs in (("us-pix", ["PIX-2026-09-US-USD"]),
+                          ("kr-wave", ["WAVE-09-SUB", "WAVE-11-REFUND-01"]),
+                          ("ru-stream", ["RU-09-PRE", "RU-09-POST"])):
+        date = "2026-11-20" if channel == "kr-wave" else "2026-10-20"
+        replay = restarted.import_settlement(channel, [
+            {"deployment_id": (dep_us if channel == "us-pix"
+                               else dep_kr if channel == "kr-wave" else dep_ru),
+             "external_ref": refs[0], "gross": "1", "currency": "USD",
+             "report_amount": "1", "period_end": "2026-09-30"}], date)
+        assert replay["results"][0]["status"] == "duplicate"
+    assert restarted.finance_report()["markets"] == finance_before["markets"]
+    restart_check = {
+        "markets": finance_before["markets"],
+        "duplicate_imports_after_restart": len(restarted.duplicate_imports),
+    }
+
     return {
-        "title": "首部作品《丝路长风·破晓》多地上线样例",
+        "title": "首部作品《丝路长风·破晓》多地上线与结算对账样例",
         "trace": trace,
         "assertions": {
             "RU_v1_locked_hours": locked_v1["hours"],
@@ -318,7 +489,20 @@ def run():
                 post_withdraw["affected_channels"],
             "post_withdraw_released_assignments":
                 post_withdraw["released_assignments"],
+            # ---- 结算对账断言 ----
+            "US_shortfall_dispute": us_dispute_id,
+            "US_final_ledger": us_totals,
+            "KR_refund_base_amount": str(kr_refund_line["base_amount"]),
+            "RU_ledger": ru_totals,
+            "quarantined_refs": [q["external_ref"]
+                                 for q in finance_before["quarantined_lines"]],
+            "restart_duplicate_imports":
+                restart_check["duplicate_imports_after_restart"],
         },
+        "finance": finance_before,
+        "trace_us_line": trace_us,
+        "trace_ru_late": trace_ru,
+        "restart_check": restart_check,
         "dashboard": dashboard,
     }
 
